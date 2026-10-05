@@ -3606,8 +3606,16 @@ unsigned char *dt_exif_xmp_decode(const char *input,
   {
     // We have compressed data in base64 representation with leading "gz"
 
+    if(len < 4 || !g_ascii_isdigit(input[2]) || !g_ascii_isdigit(input[3]))
+      return NULL;
+
     // Get stored compression factor so we know the needed buffer size for uncompress
-    const float factor = 10 * (input[2] - '0') + (input[3] - '0');
+    const uLongf factor = 10 * (input[2] - '0') + (input[3] - '0');
+    if(factor == 0) return NULL;
+
+    // Parameters and masks are normally much smaller. Keep a malformed or
+    // highly compressed value from consuming unbounded memory during import.
+    const uLongf max_output_size = 64UL * 1024UL * 1024UL;
 
     // Get a rw copy of input buffer omitting leading "gz" and compression factor
     unsigned char *buffer = (unsigned char *)strdup(input + 4);
@@ -3617,10 +3625,22 @@ unsigned char *dt_exif_xmp_decode(const char *input,
     gsize compressed_size;
     g_base64_decode_inplace((char *)buffer, &compressed_size);
 
+    if(compressed_size == 0 || compressed_size > G_MAXULONG / factor)
+    {
+      free(buffer);
+      return NULL;
+    }
+
     // Do the actual uncompress step
     int result = Z_BUF_ERROR;
     uLongf bufLen = factor * compressed_size;
     uLongf destLen;
+
+    if(bufLen > max_output_size)
+    {
+      free(buffer);
+      return NULL;
+    }
 
     // We know the actual compression factor but if that fails we retry with
     // increasing buffer sizes, eg. we don't know (unlikely) factors > 99.
@@ -3634,7 +3654,11 @@ unsigned char *dt_exif_xmp_decode(const char *input,
 
       result = uncompress(output, &destLen, buffer, compressed_size);
 
-      bufLen *= 2;
+      if(result == Z_BUF_ERROR)
+      {
+        if(bufLen == max_output_size) break;
+        bufLen = MIN(bufLen * 2, max_output_size);
+      }
 
     } while(result == Z_BUF_ERROR);
 
